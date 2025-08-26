@@ -1,0 +1,38 @@
+[project]
+name = "sai"
+version = "0.1.0"
+description = "Smart AI overlay assistant with real-time microphone transcription and Claude API integration"
+authors = [{name = "Chris Watkins", email = "chris@watkins"}]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+homepage = "https://github.com/watkinslabs/sai"
+repository = "https://github.com/watkinslabs/sai"
+
+dependencies = [
+    "PyQt6>=6.4.0",
+    "SpeechRecognition>=3.10.0",
+    "sounddevice>=0.4.6",
+    "numpy<2.0",
+    "anthropic>=0.7.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "pynput>=1.7.6",
+    "psutil>=5.9.0",
+    "torch>=2.0.0",
+    "webrtcvad>=2.0.10",
+    "openai-whisper==20231117",
+    "numba==0.58.1",
+]
+
+[project.scripts]
+sai = "overlay_assistant:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.uv]
+dev-dependencies = []

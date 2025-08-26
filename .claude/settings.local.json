@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo $XDG_SESSION_TYPE)",
+      "Bash(uv sync:*)",
+      "Bash(sudo dnf install:*)",
+      "Bash(pkill:*)",
+      "Bash(.venv/bin/python -m pip install:*)",
+      "Bash(uv add:*)",
+      "Bash(uv python install:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(uv remove:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
