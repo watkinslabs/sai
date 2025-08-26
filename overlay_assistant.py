@@ -52,6 +52,7 @@ class FastAudioListener(QThread):
     """Optimized audio listener with local Whisper and VAD"""
     
     transcription_ready = pyqtSignal(str)
+    whisper_status_changed = pyqtSignal(str)
     
     def __init__(self, device_index=None):
         super().__init__()
@@ -164,6 +165,7 @@ class FastAudioListener(QThread):
             dtype=np.float32
         ):
             print(f"Audio streaming started on device {self.device_index}")
+            self.whisper_status_changed.emit("listening")
             
             while self.running:
                 try:
@@ -212,9 +214,11 @@ class FastAudioListener(QThread):
     def process_speech_async(self, audio_data):
         """Process speech transcription asynchronously"""
         def transcribe_worker():
+            self.whisper_status_changed.emit("processing")
             text = self.transcribe_audio(audio_data)
             if text and len(text.strip()) > 2:  # Minimum text length
                 self.transcription_ready.emit(text)
+            self.whisper_status_changed.emit("listening")
         
         # Run transcription in thread pool to avoid blocking
         QThreadPool.globalInstance().start(
@@ -1140,10 +1144,15 @@ class OverlayWidget(QWidget):
                 # Use fast Whisper + VAD system
                 self.audio_listener = FastAudioListener()
                 print("Using fast audio processing with Whisper + VAD")
+                # Connect status signals for Whisper mode
+                if hasattr(self.audio_listener, 'whisper_status_changed'):
+                    self.audio_listener.whisper_status_changed.connect(self.update_whisper_status)
             else:
                 # Use optimized fallback Google STT
                 self.audio_listener = AudioListener()
                 print("Using optimized Google Speech Recognition")
+                # Set idle status for fallback mode
+                self.update_whisper_status("idle")
                 
             self.audio_listener.transcription_ready.connect(self.handle_transcription)
             self.audio_listener.start()
@@ -1234,7 +1243,7 @@ class OverlayWidget(QWidget):
             self.ai_status.setText("🤖")
             self.ai_status.setStyleSheet("color: #666; font-size: 16px;")          # Gray
             self.ai_status.setToolTip("AI idle")
-        elif status == "error"):
+        elif status == "error":
             self.ai_status.setText("⚠️")
             self.ai_status.setStyleSheet("color: #ff0000; font-size: 16px;")       # Red
             self.ai_status.setToolTip("AI error")
@@ -1389,7 +1398,8 @@ class OverlayWidget(QWidget):
         if hasattr(self, 'transcription_area') and self.transcription_area:
             self.transcription_area.setText(text)
         
-        # Show "thinking" indicator
+        # Show AI status
+        self.update_ai_status("thinking")
         self.current_response.setText("🤔 Processing...")
         
         # Get context from recent conversation (limit for speed)
@@ -1405,6 +1415,9 @@ class OverlayWidget(QWidget):
         def on_ai_response(ai_response: str):
             """Called when AI response is ready"""
             try:
+                # Update AI status
+                self.update_ai_status("responding")
+                
                 # Create conversation entry
                 entry = ConversationEntry(datetime.now(), text, ai_response)
                 self.conversation_history.append(entry)
@@ -1416,10 +1429,14 @@ class OverlayWidget(QWidget):
                 # Keep only last 100 entries
                 if len(self.conversation_history) > 100:
                     self.conversation_history = self.conversation_history[-100:]
+                
+                # Set AI back to idle after a brief delay
+                QTimer.singleShot(2000, lambda: self.update_ai_status("idle"))
                     
             except Exception as e:
                 print(f"Error handling AI response: {e}")
                 self.current_response.setText(f"Error: {str(e)}")
+                self.update_ai_status("error")
         
         # Get AI response asynchronously (non-blocking)
         self.claude_client.get_response_async(

@@ -104,6 +104,35 @@ make mic-test       # Test microphone access
 make clean          # Clean cache files
 ```
 
+## CLI Usage
+
+SAI now includes a command-line interface for easy management:
+
+```bash
+# Check system requirements and dependencies
+sai check
+
+# Set up environment file
+sai setup
+
+# Run the overlay application
+sai run
+
+# Run in debug mode
+sai run --debug
+
+# Show help
+sai --help
+```
+
+You can also run SAI directly as a Python module:
+
+```bash
+python -m sai check    # Check requirements
+python -m sai setup    # Setup environment
+python -m sai run      # Start the application
+```
+
 ## Usage
 
 ### Basic Operation
@@ -168,8 +197,17 @@ If the overlay isn't behaving correctly:
 
 ```
 /home/nd/wl/sai/
-├── overlay_assistant.py    # Main application
+├── sai/                   # Main SAI module
+│   ├── __init__.py       # Module initialization
+│   ├── __main__.py       # Module entry point
+│   ├── main.py           # Application main function
+│   ├── cli.py            # Command line interface
+│   ├── ui.py             # User interface components
+│   ├── audio.py          # Audio processing and speech recognition
+│   ├── claude_client.py  # Claude API integration
+│   └── config.py         # Configuration and settings
 ├── pyproject.toml         # Project configuration and dependencies
+├── Makefile              # Build and setup automation
 ├── .env.example          # Environment template
 ├── .env                  # Your API configuration (not in git)
 ├── README.md            # This file

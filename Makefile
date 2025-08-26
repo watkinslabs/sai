@@ -27,15 +27,12 @@ help:
 # Check system requirements
 check:
 	@echo "Checking system requirements..."
-	@python3 --version || (echo "Python 3.10+ required" && exit 1)
+	@python3 --version || (echo "Python 3.9+ required" && exit 1)
 	@which uv > /dev/null || (echo "uv package manager required: https://docs.astral.sh/uv/" && exit 1)
 	@echo "✓ Python and uv found"
 	@echo ""
-	@echo "Audio system check:"
-	@pulseaudio --check -v && echo "✓ PulseAudio running" || echo "⚠ PulseAudio not running"
-	@echo ""
-	@echo "Available microphones:"
-	@pactl list sources short 2>/dev/null | grep -v monitor || echo "No microphones found via PulseAudio"
+	@echo "Running SAI requirements check..."
+	.venv/bin/python -m sai check
 
 # Install basic dependencies
 install:
@@ -64,12 +61,14 @@ install-whisper:
 # Complete setup with everything
 setup: check install install-whisper
 	@echo ""
+	@echo "Setting up environment..."
+	.venv/bin/python -m sai setup
+	@echo ""
 	@echo "🎉 Setup complete!"
 	@echo ""
 	@echo "Next steps:"
-	@echo "1. Copy .env.example to .env"
-	@echo "2. Add your ANTHROPIC_API_KEY to .env"
-	@echo "3. Run: make run"
+	@echo "1. Edit .env and add your ANTHROPIC_API_KEY"
+	@echo "2. Run: make run"
 
 # Run the application
 run:
@@ -79,7 +78,7 @@ run:
 		echo "Copy .env.example to .env and add your ANTHROPIC_API_KEY"; \
 		exit 1; \
 	fi
-	.venv/bin/python overlay_assistant.py
+	.venv/bin/python -m sai run
 
 # Development mode with debug output
 dev:
@@ -89,7 +88,7 @@ dev:
 		echo "Copy .env.example to .env and add your ANTHROPIC_API_KEY"; \
 		exit 1; \
 	fi
-	DEBUG=1 .venv/bin/python overlay_assistant.py
+	DEBUG=1 .venv/bin/python -m sai run --debug
 
 # Run basic tests
 test:
