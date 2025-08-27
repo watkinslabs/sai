@@ -7,7 +7,7 @@ import time
 import speech_recognition as sr
 import sounddevice as sd
 import numpy as np
-from PyQt6.QtCore import QThread, pyqtSignal, QThreadPool
+from PyQt6.QtCore import QThread, pyqtSignal, QThreadPool, QRunnable
 
 try:
     import whisper
@@ -22,12 +22,13 @@ class FastAudioListener(QThread):
     
     transcription_ready = pyqtSignal(str)
     whisper_status_changed = pyqtSignal(str)
+    claude_ready = pyqtSignal(str)  # Separate signal for Claude processing
     
     def __init__(self, device_index=None):
         super().__init__()
         self.device_index = device_index
         self.running = False
-        self.sample_rate = 16000
+        self.sample_rate = 16000  # Will be updated based on device
         self.chunk_size = int(0.5 * self.sample_rate)  # 0.5 second chunks
         self.buffer = queue.Queue()
         
@@ -40,15 +41,27 @@ class FastAudioListener(QThread):
             print(f"Failed to load Whisper: {e}, falling back to Google")
             self.whisper_model = None
         
-        # Voice Activity Detection
-        self.vad = webrtcvad.Vad(2)  # Aggressiveness level 0-3 (2 is balanced)
+        # Voice Activity Detection - less sensitive to avoid false positives
+        self.vad = webrtcvad.Vad(2)  # Aggressiveness level 0-3 (2 is more selective)
         
         # Audio processing
         self.audio_queue = queue.Queue()
         self.speech_frames = []
         self.is_speaking = False
         self.silence_count = 0
-        self.max_silence = 10  # frames of silence before processing
+        self.max_silence = 3  # Much faster pause detection (1.5 seconds)
+        self.min_speech_frames = 2  # Even faster minimum (1 second)
+        self.max_speech_frames = 16  # Process after 8 seconds max
+        
+        # Thread-safe transcription results  
+        self._transcription_result = None
+        self._transcription_ready = False
+        self._partial_transcription = ""
+        self._partial_ready = False
+        
+        # Accumulate all transcribed text for complete Claude requests
+        self._accumulated_text = ""
+        self._text_segments = []
         
     def update_microphone(self, device_index):
         """Update the microphone device"""
@@ -56,17 +69,67 @@ class FastAudioListener(QThread):
     
     @staticmethod
     def get_microphone_list():
-        """Get list of available microphones"""
+        """Get list of available audio sources (mics + loopback), sorted by name"""
         try:
-            mic_list = []
+            audio_sources = []
             devices = sd.query_devices()
+            
             for i, device in enumerate(devices):
-                if device['max_input_channels'] > 0:  # Only input devices
-                    mic_list.append((i, device['name']))
-            return mic_list
+                device_name = device['name']
+                
+                # Add input devices (microphones)
+                if device['max_input_channels'] > 0:
+                    if 'loopback' in device_name.lower() or 'stereo mix' in device_name.lower() or 'what u hear' in device_name.lower():
+                        display_name = f"🔊 {device_name} (System Audio)"
+                    else:
+                        display_name = f"🎤 {device_name}"
+                    audio_sources.append((i, display_name))
+                
+                # For Linux PulseAudio: Look for monitor devices (system audio capture)
+                elif 'monitor' in device_name.lower() and device['max_input_channels'] > 0:
+                    # This is a monitor device - can capture system audio
+                    base_name = device_name.replace('.monitor', '').replace(' Monitor', '')
+                    display_name = f"🔊 {base_name} (System Audio)"
+                    audio_sources.append((i, display_name))
+            
+            # Sort by type (microphones first, then system audio)
+            audio_sources.sort(key=lambda x: (not x[1].startswith('🎤'), x[1].lower()))
+            return audio_sources
         except Exception as e:
-            print(f"Error getting microphone list: {e}")
-            return [(None, "Default Microphone")]
+            print(f"Error getting audio device list: {e}")
+            return [(None, "🎤 Default Microphone")]
+    
+    @staticmethod
+    def is_system_audio_device(device_name):
+        """Check if a device is likely a system audio capture device"""
+        system_keywords = [
+            'loopback', 'stereo mix', 'what u hear', 'monitor', 
+            'wave out mix', 'speakers', 'headphones'
+        ]
+        return any(keyword in device_name.lower() for keyword in system_keywords)
+    
+    @staticmethod 
+    def get_system_audio_info():
+        """Get information about available system audio capture methods"""
+        try:
+            devices = sd.query_devices()
+            system_devices = []
+            
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    device_name = device['name']
+                    if FastAudioListener.is_system_audio_device(device_name):
+                        system_devices.append({
+                            'index': i,
+                            'name': device_name,
+                            'channels': device['max_input_channels'],
+                            'sample_rate': device['default_samplerate']
+                        })
+            
+            return system_devices
+        except Exception as e:
+            print(f"Error getting system audio info: {e}")
+            return []
     
     def is_speech(self, audio_chunk):
         """Check if audio chunk contains speech using WebRTC VAD"""
@@ -74,9 +137,25 @@ class FastAudioListener(QThread):
             # Convert to 16-bit PCM
             pcm_data = (audio_chunk * 32767).astype(np.int16).tobytes()
             
+            # VAD works with specific frame sizes (10, 20, or 30ms) at 8, 16, 32, or 48kHz
+            # We need to resample to a supported rate for VAD
+            vad_sample_rate = 16000  # VAD-supported rate
+            if self.sample_rate not in [8000, 16000, 32000, 48000]:
+                # Resample audio chunk to 16kHz for VAD with consistent float32
+                audio_chunk = np.array(audio_chunk, dtype=np.float32)
+                target_length = int(len(audio_chunk) * vad_sample_rate / self.sample_rate)
+                old_indices = np.linspace(0.0, len(audio_chunk) - 1.0, len(audio_chunk), dtype=np.float32)
+                new_indices = np.linspace(0.0, len(audio_chunk) - 1.0, target_length, dtype=np.float32)
+                audio_chunk = np.interp(new_indices, old_indices, audio_chunk).astype(np.float32)
+            else:
+                vad_sample_rate = self.sample_rate
+            
+            # Convert to 16-bit PCM for resampled audio
+            pcm_data = (audio_chunk * 32767).astype(np.int16).tobytes()
+            
             # VAD works with specific frame sizes (10, 20, or 30ms)
             frame_duration = 30  # ms
-            frame_size = int(self.sample_rate * frame_duration / 1000)
+            frame_size = int(vad_sample_rate * frame_duration / 1000)
             
             # Process in frames
             frames = len(pcm_data) // (frame_size * 2)  # 2 bytes per sample
@@ -88,16 +167,16 @@ class FastAudioListener(QThread):
                 frame_data = pcm_data[start:end]
                 
                 if len(frame_data) == frame_size * 2:
-                    if self.vad.is_speech(frame_data, self.sample_rate):
+                    if self.vad.is_speech(frame_data, vad_sample_rate):
                         speech_frames += 1
             
-            # Consider it speech if more than 30% of frames contain speech
-            return speech_frames > (frames * 0.3)
+            # Consider it speech if more than 50% of frames contain speech (even less sensitive)
+            return speech_frames > (frames * 0.5)
             
         except Exception:
-            # Fallback: simple energy-based detection
+            # Fallback: simple energy-based detection with higher threshold
             energy = np.sum(audio_chunk ** 2)
-            return energy > 0.01  # Threshold for basic energy detection
+            return energy > 0.02  # Higher threshold to reduce false positives
     
     def transcribe_audio(self, audio_data):
         """Transcribe audio using Whisper"""
@@ -105,12 +184,30 @@ class FastAudioListener(QThread):
             return ""
         
         try:
-            # Ensure audio is float32 and normalized
-            audio = audio_data.astype(np.float32)
+            # Ensure audio is float32 consistently throughout
+            audio = np.array(audio_data, dtype=np.float32)
             
             # Whisper expects audio to be in the range [-1, 1] and at 16kHz
             if audio.max() > 1.0:
                 audio = audio / 32767.0  # Normalize if needed
+            
+            # Resample to 16kHz if needed (Whisper's expected rate)
+            if self.sample_rate != 16000:
+                # Use scipy-style resampling with consistent float32 types
+                from scipy import signal
+                try:
+                    # Try scipy resampling first (more accurate)
+                    target_samples = int(len(audio) * 16000 / self.sample_rate)
+                    audio = signal.resample(audio, target_samples).astype(np.float32)
+                except ImportError:
+                    # Fallback to simple linear interpolation with explicit float32
+                    target_length = int(len(audio) * 16000.0 / self.sample_rate)
+                    old_indices = np.linspace(0.0, len(audio) - 1.0, len(audio), dtype=np.float32)
+                    new_indices = np.linspace(0.0, len(audio) - 1.0, target_length, dtype=np.float32)
+                    audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+            
+            # Final dtype check
+            audio = audio.astype(np.float32)
             
             # Transcribe with Whisper
             result = self.whisper_model.transcribe(audio, fp16=False, language='en')
@@ -131,6 +228,18 @@ class FastAudioListener(QThread):
         if self.device_index is None:
             print("No working audio devices found")
             return
+        
+        # Get device sample rate
+        try:
+            devices = sd.query_devices()
+            device_info = devices[self.device_index]
+            self.sample_rate = int(device_info['default_samplerate'])
+            self.chunk_size = int(0.5 * self.sample_rate)  # Update chunk size
+            print(f"Using device sample rate: {self.sample_rate}Hz")
+        except Exception as e:
+            print(f"Error getting device info: {e}, using default 44100Hz")
+            self.sample_rate = 44100
+            self.chunk_size = int(0.5 * self.sample_rate)
         
         def audio_callback(indata, frames, time, status):
             if status:
@@ -161,6 +270,12 @@ class FastAudioListener(QThread):
                     has_speech = self.is_speech(audio_chunk)
                     
                     if has_speech:
+                        # If we just started speaking after silence, reset accumulation
+                        if not self.is_speaking:
+                            self._accumulated_text = ""
+                            self._text_segments = []
+                            print("New speech started - reset text accumulation")
+                        
                         self.speech_frames.append(audio_chunk)
                         self.is_speaking = True
                         self.silence_count = 0
@@ -172,19 +287,39 @@ class FastAudioListener(QThread):
                             if self.silence_count <= 3:
                                 self.speech_frames.append(audio_chunk)
                     
-                    # Process speech when silence detected after speech
+                    # Process speech in multiple scenarios for faster response
+                    should_process = False
+                    
+                    # Process if we have enough silence after speech
                     if self.is_speaking and self.silence_count >= self.max_silence:
-                        if len(self.speech_frames) > 5:  # Minimum frames for processing
-                            # Combine speech frames
-                            speech_audio = np.concatenate(self.speech_frames)
-                            
-                            # Transcribe in separate thread to avoid blocking
-                            self.process_speech_async(speech_audio)
+                        should_process = True
+                    
+                    # Process if we have enough speech frames (streaming behavior)
+                    elif self.is_speaking and len(self.speech_frames) >= self.max_speech_frames:
+                        should_process = True
+                        # Don't reset completely - keep some context
                         
-                        # Reset for next speech segment
-                        self.speech_frames = []
-                        self.is_speaking = False
-                        self.silence_count = 0
+                    if should_process and len(self.speech_frames) >= self.min_speech_frames:
+                        # Combine speech frames
+                        speech_audio = np.concatenate(self.speech_frames)
+                        
+                        # Show partial transcription INSTANTLY while processing
+                        self._partial_transcription = f"[Processing {len(self.speech_frames)} frames of speech...]"
+                        self._partial_ready = True
+                        
+                        # Transcribe in separate thread to avoid blocking
+                        is_final = self.silence_count >= self.max_silence
+                        self.process_speech_async(speech_audio, is_final)
+                        
+                        # For streaming mode, keep some overlap for context
+                        if len(self.speech_frames) >= self.max_speech_frames:
+                            # Keep last 5 frames for context
+                            self.speech_frames = self.speech_frames[-5:]
+                        else:
+                            # Complete reset for end of speech
+                            self.speech_frames = []
+                            self.is_speaking = False
+                            self.silence_count = 0
                     
                     # Clear buffer if too long without speech
                     if len(self.speech_frames) > 100:  # ~50 seconds at 0.5s chunks
@@ -196,19 +331,81 @@ class FastAudioListener(QThread):
                     print(f"Audio processing error: {e}")
                     time.sleep(0.1)
     
-    def process_speech_async(self, audio_data):
+    def process_speech_async(self, audio_data, is_final=False):
         """Process speech transcription asynchronously"""
-        def transcribe_worker():
-            self.whisper_status_changed.emit("processing")
-            text = self.transcribe_audio(audio_data)
-            if text and len(text.strip()) > 2:  # Minimum text length
-                self.transcription_ready.emit(text)
-            self.whisper_status_changed.emit("listening")
+        # Emit status change from main thread (this QThread)
+        self.whisper_status_changed.emit("processing")
         
-        # Run transcription in thread pool to avoid blocking
-        QThreadPool.globalInstance().start(
-            lambda: transcribe_worker()
-        )
+        # Use Python threading instead of Qt threading to avoid Qt object issues
+        import threading
+        
+        def transcribe_worker():
+            try:
+                text = self.transcribe_audio(audio_data)
+                # Store results for main thread to pick up
+                self._transcription_result = text
+                self._transcription_ready = True
+                self._is_final = is_final  # Track if this should be sent to Claude
+            except Exception as e:
+                print(f"Transcription worker error: {e}")
+                self._transcription_result = None
+                self._transcription_ready = True
+                self._is_final = is_final
+        
+        # Run in Python thread instead of Qt thread pool
+        thread = threading.Thread(target=transcribe_worker, daemon=True)
+        thread.start()
+    
+    def check_transcription_results(self):
+        """Check for transcription results from worker thread (call from main thread)"""
+        # Check for partial transcriptions (instant display)
+        if self._partial_ready:
+            self._partial_ready = False
+            # Emit partial transcription for instant display
+            self.transcription_ready.emit(self._partial_transcription)
+            
+        # Check for full transcriptions (accumulate and send to Claude if final)
+        if self._transcription_ready:
+            self._transcription_ready = False
+            if self._transcription_result and len(self._transcription_result.strip()) > 2:
+                transcribed_text = self._transcription_result.strip()
+                
+                # Filter out suspicious single-word false positives
+                if len(transcribed_text.split()) == 1 and transcribed_text.upper() in ["YOU", "THE", "A", "I", "IT", "IS", "TO", "AND", "OR"]:
+                    print(f"Filtering out suspicious single word: '{transcribed_text}'")
+                    # Reset status back to listening
+                    self.whisper_status_changed.emit("listening")
+                    self._transcription_result = None
+                    return
+                
+                # Emit the actual transcription for instant display
+                self.transcription_ready.emit(transcribed_text)
+                
+                # Accumulate this text segment
+                if transcribed_text not in self._text_segments:  # Avoid duplicates
+                    self._text_segments.append(transcribed_text)
+                    self._accumulated_text = " ".join(self._text_segments)
+                    print(f"Accumulated text: '{self._accumulated_text}'")
+                
+                # If this is final (pause detected), send ALL accumulated text to Claude
+                if getattr(self, '_is_final', False):
+                    if self._accumulated_text and hasattr(self, 'claude_ready'):
+                        # Filter: Only send to Claude if we have multiple words (at least 2)
+                        word_count = len(self._accumulated_text.split())
+                        if word_count >= 2:
+                            print(f"Sending to Claude ({word_count} words): '{self._accumulated_text}'")
+                            self.claude_ready.emit(self._accumulated_text)
+                        else:
+                            print(f"Skipping Claude - only {word_count} word(s): '{self._accumulated_text}'")
+                    
+                    # Reset accumulation after processing
+                    self._accumulated_text = ""
+                    self._text_segments = []
+                    print("Reset accumulated text after processing")
+            
+            # Reset status back to listening
+            self.whisper_status_changed.emit("listening")
+            self._transcription_result = None
     
     def find_working_device(self):
         """Find first working audio input device"""
@@ -286,13 +483,15 @@ class AudioListener(QThread):
     
     @staticmethod
     def get_microphone_list():
-        """Get list of available microphones"""
+        """Get list of available microphones, sorted by name"""
         try:
             mic_list = []
             devices = sd.query_devices()
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:  # Only input devices
                     mic_list.append((i, device['name']))
+            # Sort by device name for better organization
+            mic_list.sort(key=lambda x: x[1].lower())
             return mic_list
         except Exception as e:
             print(f"Error getting microphone list: {e}")

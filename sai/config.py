@@ -20,8 +20,16 @@ class Config:
         'show_transcription': True,
         'window_width': 600,
         'window_height': 400,
+        'window_x': None,  # Window position
+        'window_y': None,
         'use_fast_mode': True,
-        'microphone_device': None,
+        'microphone_device_index': None,
+        'microphone_device_name': '',
+        # AI Templates
+        'template_default': 'Context: {context}\nInput: "{text}"\nBrief response (max 30 words):',
+        'template_meeting': 'Meeting context: {context}\nCurrent: "{text}"\nKey point (max 20 words):',
+        'template_learning': 'Context: {context}\nTopic: "{text}"\nQuick insight (max 25 words):',
+        'template_summary': 'Context: {context}\nText: "{text}"\nSummary (max 25 words):',
     }
     
     @staticmethod

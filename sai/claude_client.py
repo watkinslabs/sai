@@ -3,6 +3,7 @@ Claude API client for SAI
 """
 
 import anthropic
+import threading
 from PyQt6.QtCore import QRunnable, QThreadPool
 
 class AsyncClaudeWorker(QRunnable):
@@ -41,7 +42,7 @@ class ClaudeClient:
         """Generate cache key for request"""
         return f"{mode}:{hash(text + context)}"
     
-    def get_response_sync(self, text: str, context: str = "", custom_prompt: str = "", mode: str = "default") -> str:
+    def get_response_sync(self, text: str, context: str = "", custom_prompt: str = "", mode: str = "default", settings: dict = None) -> str:
         """Synchronous API call (for worker threads)"""
         try:
             # Check cache first
@@ -49,18 +50,30 @@ class ClaudeClient:
             if cache_key in self.response_cache:
                 return self.response_cache[cache_key]
             
-            # Prompt templates for different modes (shortened for speed)
-            prompts = {
-                "default": f"Context: {context}\\nInput: \"{text}\"\\nBrief response (max 30 words):",
-                
-                "meeting": f"Meeting context: {context}\\nCurrent: \"{text}\"\\nKey point (max 20 words):",
-                
-                "learning": f"Context: {context}\\nTopic: \"{text}\"\\nQuick insight (max 25 words):",
-                
-                "summary": f"Context: {context}\\nText: \"{text}\"\\nSummary (max 25 words):",
-                
-                "custom": custom_prompt.format(text=text, context=context) if custom_prompt else f"Respond to: {text}"
-            }
+            # Get templates from settings or use defaults
+            if settings:
+                templates = {
+                    "default": settings.get('template_default', 'Context: {context}\nInput: "{text}"\nBrief response (max 30 words):'),
+                    "meeting": settings.get('template_meeting', 'Meeting context: {context}\nCurrent: "{text}"\nKey point (max 20 words):'),
+                    "learning": settings.get('template_learning', 'Context: {context}\nTopic: "{text}"\nQuick insight (max 25 words):'),
+                    "summary": settings.get('template_summary', 'Context: {context}\nText: "{text}"\nSummary (max 25 words):'),
+                }
+            else:
+                # Fallback templates
+                templates = {
+                    "default": 'Context: {context}\nInput: "{text}"\nBrief response (max 30 words):',
+                    "meeting": 'Meeting context: {context}\nCurrent: "{text}"\nKey point (max 20 words):',
+                    "learning": 'Context: {context}\nTopic: "{text}"\nQuick insight (max 25 words):',
+                    "summary": 'Context: {context}\nText: "{text}"\nSummary (max 25 words):',
+                }
+            
+            # Format the prompts with actual values
+            prompts = {}
+            for mode_name, template in templates.items():
+                prompts[mode_name] = template.format(text=text, context=context)
+            
+            # Handle custom mode
+            prompts["custom"] = custom_prompt.format(text=text, context=context) if custom_prompt else f"Respond to: {text}"
             
             prompt = prompts.get(mode, prompts["default"])
 
@@ -87,8 +100,8 @@ class ClaudeClient:
         except Exception as e:
             return f"API Error: {str(e)}"
     
-    def get_response_async(self, text: str, context: str = "", custom_prompt: str = "", mode: str = "default", callback=None):
-        """Async API call using thread pool"""
+    def get_response_async(self, text: str, context: str = "", custom_prompt: str = "", mode: str = "default", callback=None, settings: dict = None):
+        """Async API call using Python threading instead of Qt threading"""
         if not callback:
             return self.get_response_sync(text, context, custom_prompt, mode)
         
@@ -98,6 +111,13 @@ class ClaudeClient:
             callback(self.response_cache[cache_key])
             return
         
-        # Queue worker for API call
-        worker = AsyncClaudeWorker(self, text, context, custom_prompt, mode, callback)
-        self.thread_pool.start(worker)
+        # Use Python threading to avoid Qt threading issues
+        def api_worker():
+            try:
+                response = self.get_response_sync(text, context, custom_prompt, mode, settings)
+                callback(response)
+            except Exception as e:
+                callback(f"Error: {str(e)}")
+        
+        thread = threading.Thread(target=api_worker, daemon=True)
+        thread.start()

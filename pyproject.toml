@@ -18,14 +18,27 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pynput>=1.7.6",
     "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+whisper = [
     "torch>=2.0.0",
     "webrtcvad>=2.0.10",
     "openai-whisper==20231117",
     "numba==0.58.1",
+    "scipy>=1.13.1",
+]
+full = [
+    "torch>=2.0.0",
+    "webrtcvad>=2.0.10",
+    "openai-whisper==20231117",
+    "numba==0.58.1",
+    "scipy>=1.13.1",
 ]
 
 [project.scripts]
 sai = "sai.cli:main"
+sai-setup = "sai.setup:main"
 
 [build-system]
 requires = ["hatchling"]
