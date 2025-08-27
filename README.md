@@ -6,6 +6,8 @@ A powerful overlay application for Linux that provides real-time AI assistance t
 
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen) ![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue) ![License MIT](https://img.shields.io/badge/License-MIT-green)
 
+![SAI](assets/sai.png) 
+
 ## Features
 
 ### Core Functionality
